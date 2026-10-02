@@ -1,0 +1,24 @@
+parameters:
+  level: 4
+  tmpDir: .phpstan-cache
+  paths:
+    - src
+    - app
+    - bin
+    - tests
+  bootstrapFiles:
+    - app/init/constants.php
+  scanDirectories:
+    - vendor/swoole/ide-helper
+  excludePaths:
+    - tests/resources
+  ignoreErrors:
+    # The E2E harness talks to the stack under test, not to a destination a user chose
+    -
+      identifier: function.disallowedCurl
+      path: tests/*
+services:
+  -
+    class: Utopia\Client\PHPStan\DisallowRawCurlExtension
+    tags:
+      - phpstan.restrictedFunctionUsageExtension

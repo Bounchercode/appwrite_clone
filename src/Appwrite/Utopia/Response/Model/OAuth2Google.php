@@ -1,0 +1,77 @@
+<?php
+
+namespace Appwrite\Utopia\Response\Model;
+
+use Appwrite\Utopia\Response;
+
+class OAuth2Google extends OAuth2Base
+{
+    public array $conditions = [
+        '$id' => 'google',
+    ];
+
+    public function getProviderLabel(): string
+    {
+        return 'Google';
+    }
+
+    public function getClientIdExample(): string
+    {
+        return 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+    }
+
+    public function getClientSecretExample(): string
+    {
+        return 'YOUR_GOOGLE_CLIENT_SECRET';
+    }
+
+    public function getPromptValues(): array
+    {
+        return ['none', 'consent', 'select_account'];
+    }
+
+    public function getPromptDefault(): array
+    {
+        return ['consent'];
+    }
+
+    public function __construct()
+    {
+        parent::__construct();
+
+        $this->addRule('nativeEnabled', [
+            'type' => self::TYPE_BOOLEAN,
+            'description' => 'Native Google sign-in is active and can be used to create sessions from an ID token. Independent of enabled, which only controls the browser-based flow.',
+            'default' => false,
+            'example' => false,
+        ]);
+
+        $this->addRule('nativeClientIds', [
+            'type' => self::TYPE_STRING,
+            'description' => 'Additional OAuth2 client IDs accepted as ID token audiences for native sign-in, next to the client ID.',
+            'default' => [],
+            'example' => ['YOUR_ANDROID_CLIENT_ID.apps.googleusercontent.com'],
+            'array' => true,
+        ]);
+    }
+
+    /**
+     * Get Name
+     *
+     * @return string
+     */
+    public function getName(): string
+    {
+        return 'OAuth2Google';
+    }
+
+    /**
+     * Get Type
+     *
+     * @return string
+     */
+    public function getType(): string
+    {
+        return Response::MODEL_OAUTH2_GOOGLE;
+    }
+}

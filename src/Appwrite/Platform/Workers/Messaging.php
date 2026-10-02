@@ -1,0 +1,1223 @@
+<?php
+
+namespace Appwrite\Platform\Workers;
+
+use Appwrite\Event\Message\Usage;
+use Appwrite\Event\Publisher\Usage as UsagePublisher;
+use Appwrite\Messaging\Adapter\Mqtt;
+use Appwrite\Messaging\Adapter\Push\Appwrite as AppwritePush;
+use Appwrite\Messaging\Provider;
+use Appwrite\Messaging\Status as MessageStatus;
+use Appwrite\OpenSSL\OpenSSL;
+use Appwrite\PubSub\Adapter\Pool as PubSubPool;
+use Appwrite\Usage\Context as UsageContext;
+use Utopia\Compression\Algorithms\GZIP;
+use Utopia\Compression\Algorithms\Zstd;
+use Utopia\Compression\Compression;
+use Utopia\Config\Config;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\Helpers\ID;
+use Utopia\Database\Query;
+use Utopia\Lock\Semaphore;
+use Utopia\Messaging\Adapter\Email as EmailAdapter;
+use Utopia\Messaging\Adapter\Email\Mailgun;
+use Utopia\Messaging\Adapter\Email\Sendgrid;
+use Utopia\Messaging\Adapter\Email\SMTP;
+use Utopia\Messaging\Adapter\Push\APNS;
+use Utopia\Messaging\Adapter\Push as PushAdapter;
+use Utopia\Messaging\Adapter\Push\FCM;
+use Utopia\Messaging\Adapter\SMS as SMSAdapter;
+use Utopia\Messaging\Adapter\SMS\GEOSMS\CallingCode;
+use Utopia\Messaging\Adapter\SMS\Mock;
+use Utopia\Messaging\Adapter\SMS\Msg91\MetadataParameter;
+use Utopia\Messaging\Exception\InvalidArgumentException;
+use Utopia\Messaging\Messages\Email;
+use Utopia\Messaging\Messages\Email\Attachment;
+use Utopia\Messaging\Messages\Push;
+use Utopia\Messaging\Messages\SMS;
+use Utopia\Messaging\Priority;
+use Utopia\Mqtt\Packet;
+use Utopia\Platform\Action;
+use Utopia\Pools\Group;
+use Utopia\Psr7\Stream;
+use Utopia\Queue\Message;
+use Utopia\Span\Span;
+use Utopia\Storage\Device;
+use Utopia\Storage\Device\Local;
+use Utopia\Storage\DeviceType;
+use Utopia\System\System;
+use Utopia\Telemetry\Adapter as Telemetry;
+
+use function Swoole\Coroutine\batch;
+
+class Messaging extends Action
+{
+    private Telemetry $telemetry;
+
+    private Provider $provider;
+
+    private Group $pools;
+
+    public static function getName(): string
+    {
+        return 'messaging';
+    }
+
+    /**
+     * @throws \Exception
+     */
+    public function __construct()
+    {
+        $this
+            ->desc('Messaging worker')
+            ->inject('message')
+            ->inject('project')
+            ->inject('dbForProject')
+            ->inject('deviceForFiles')
+            ->inject('publisherForUsage')
+            ->inject('telemetry')
+            ->inject('pools')
+            ->inject('adapterForSMS')
+            ->callback($this->action(...));
+    }
+
+    /**
+     * @param Message $message
+     * @param Document $project
+     * @param Database $dbForProject
+     * @param Device $deviceForFiles
+     * @param UsagePublisher $publisherForUsage
+     * @param Telemetry $telemetry
+     * @param SMSAdapter|null $adapterForSMS
+     * @param Group $pools
+     * @return void
+     * @throws \Exception
+     */
+    public function action(
+        Message $message,
+        Document $project,
+        Database $dbForProject,
+        Device $deviceForFiles,
+        UsagePublisher $publisherForUsage,
+        Telemetry $telemetry,
+        Group $pools,
+        ?SMSAdapter $adapterForSMS
+    ): void {
+        $this->telemetry = $telemetry;
+        $this->pools = $pools;
+        $this->provider = new Provider($telemetry);
+        $payload = $message->getPayload();
+
+        if (empty($payload)) {
+            throw new \Exception('Missing payload');
+        }
+
+        $type = $payload['type'] ?? '';
+
+        Span::add('message.type', $type);
+
+        switch ($type) {
+            case MESSAGE_SEND_TYPE_INTERNAL:
+                $message = new Document($payload['message'] ?? []);
+                $recipients = $payload['recipients'] ?? [];
+
+                $this->sendInternalSMSMessage($message, $project, $recipients, $adapterForSMS);
+                break;
+            case MESSAGE_SEND_TYPE_EXTERNAL:
+                $messageId = $payload['messageId'];
+                $message = $dbForProject->getDocument('messages', $messageId);
+
+                // Unique per job so a redelivery cannot reclaim a directory a live job is still
+                // reading; the underscore prefix is unreachable, as a bucket ID may not start with one.
+                $attachmentsPath = $this->getLocalDevice($project)->getPath('_attachments/' . ID::unique());
+
+                try {
+                    if ($message->isEmpty()) {
+                        throw new \Exception('Message not found: ' . $messageId);
+                    }
+
+                    $this->sendExternalMessage($dbForProject, $message, $deviceForFiles, $project, $publisherForUsage, $attachmentsPath);
+                } catch (\Throwable $e) {
+                    $this->markFailed($dbForProject, $messageId, $e);
+
+                    throw $e;
+                } finally {
+                    // Decrypted plaintext must not linger. A failed delete and an absent directory both come
+                    // back false, so only a directory that is still there after the attempt is worth
+                    // reporting; throwing here would bury whatever the send itself threw.
+                    $deviceForLocal = $this->getLocalDevice($project);
+                    $deviceForLocal->delete($attachmentsPath, true);
+
+                    if ($deviceForLocal->exists($attachmentsPath)) {
+                        Span::add('message.attachments_cleanup_failed', $attachmentsPath);
+                    }
+                }
+                break;
+            default:
+                throw new \Exception('Unknown message type: ' . $type);
+        }
+    }
+
+    /**
+     * Record a failure for a job that died before writing a terminal status. A failed job is dead-lettered
+     * rather than redelivered, so a message left processing stays that way for good.
+     */
+    private function markFailed(Database $dbForProject, string $messageId, \Throwable $error): void
+    {
+        try {
+            $message = $dbForProject->getDocument('messages', $messageId);
+
+            if ($message->isEmpty() || \in_array($message->getAttribute('status'), [MessageStatus::SENT, MessageStatus::FAILED], true)) {
+                return;
+            }
+
+            $dbForProject->updateDocument('messages', $messageId, new Document([
+                'status' => MessageStatus::FAILED,
+                'deliveryErrors' => [$error->getMessage()],
+            ]));
+        } catch (\Throwable) {
+            // Never mask the original failure, which the caller rethrows.
+        }
+    }
+
+    private function sendExternalMessage(
+        Database $dbForProject,
+        Document $message,
+        Device $deviceForFiles,
+        Document $project,
+        UsagePublisher $publisherForUsage,
+        string $attachmentsPath
+    ): void {
+        $status = $message->getAttribute('status');
+
+        // Idempotency guard: queue redelivery can hand us a message that already finished.
+        if (\in_array($status, [MessageStatus::SENT, MessageStatus::FAILED], true)) {
+            Span::add('message.skipped', 'already_processed');
+            return;
+        }
+
+        $topicIds = $message->getAttribute('topics', []);
+        $targetIds = $message->getAttribute('targets', []);
+        $userIds = $message->getAttribute('users', []);
+        $providerType = $message->getAttribute('providerType');
+
+        Span::add('message.provider_type', $providerType);
+
+        $default = $dbForProject->findOne('providers', [
+            Query::equal('enabled', [true]),
+            Query::equal('type', [$providerType]),
+        ]);
+
+        if ($default->isEmpty()) {
+            $dbForProject->updateDocument('messages', $message->getId(), $message->setAttributes([
+                'status' => MessageStatus::FAILED,
+                'deliveryErrors' => ['No enabled provider found.']
+            ]));
+
+            Span::add('message.skipped', 'no_enabled_provider');
+            return;
+        }
+
+        // Hoisted out of buildMessage(), which every batch and every retry attempt calls.
+        $attachments = $providerType === MESSAGE_TYPE_EMAIL
+            ? $this->prepareAttachments($dbForProject, $message, $deviceForFiles, $project, $attachmentsPath)
+            : [];
+
+        /**
+         * Resolved providers cached for the lifetime of this job, keyed by provider id.
+         * Seeded with the default provider so most sends never touch the providers collection.
+         *
+         * @var array<string, Document> $providers
+         */
+        $providers = [
+            $default->getId() => $default,
+        ];
+
+        $semaphore = new Semaphore(MESSAGE_SEND_CONCURRENCY);
+
+        $deliveredTotal = 0;
+        $failedTotal = 0;
+        $deliveryErrors = [];
+        $hasRecipients = false;
+
+        foreach ($this->streamRecipients($dbForProject, $topicIds, $userIds, $targetIds, $providerType, $default) as [$page, $perUser]) {
+            /**
+             * @var array<callable> $tasks
+             */
+            $tasks = [];
+
+            foreach ($page as $providerId => $identifiers) {
+                $provider = $this->resolveProvider($dbForProject, $providerId, $providers, $default);
+                $resolvedProviderType = $provider->getAttribute('type');
+
+                $adapter = match ($resolvedProviderType) {
+                    MESSAGE_TYPE_SMS => $this->provider->sms($provider),
+                    MESSAGE_TYPE_PUSH => $this->getPushAdapter($provider, $dbForProject, $project, $message),
+                    MESSAGE_TYPE_EMAIL => $this->provider->email($provider),
+                    default => throw new \Exception('Provider with the requested ID is of the incorrect type')
+                };
+
+                // A user- or target-addressed Appwrite push is delivered on the reserved per-user
+                // topic users/<userId>, so a user's targets collapse to one implicit topic. Topic
+                // campaigns (and every other provider) keep sending to the resolved identifiers.
+                $recipients = \array_keys($identifiers);
+                if ($perUser && $resolvedProviderType === MESSAGE_TYPE_PUSH && $provider->getAttribute('provider') === 'appwrite') {
+                    $userTopics = [];
+                    foreach ($identifiers as $userId) {
+                        if (!empty($userId)) {
+                            $userTopics['users/' . $userId] = null;
+                        }
+                    }
+                    $recipients = \array_keys($userTopics);
+                }
+
+                $batches = \array_chunk(
+                    $recipients,
+                    $adapter->getMaxMessagesPerRequest()
+                );
+
+                foreach ($batches as $batch) {
+                    $tasks[] = fn (): array => $semaphore->withLock(
+                        fn (): array => $this->sendBatch(
+                            $batch,
+                            $message,
+                            $provider,
+                            $resolvedProviderType,
+                            $adapter,
+                            $dbForProject,
+                            $project,
+                            $publisherForUsage,
+                            $attachments
+                        )
+                    );
+                }
+            }
+
+            // A page can resolve to zero identifiers (e.g. subscribers whose targetInternalId matches no targets
+            // row), so an empty task list must not count as recipients or run batch() for nothing.
+            if (empty($tasks)) {
+                continue;
+            }
+
+            $hasRecipients = true;
+
+            /**
+             * @var array<array{delivered: int, recipients: int, errors: array<string>}> $results
+             */
+            $results = batch($tasks);
+
+            foreach ($results as $result) {
+                $deliveredTotal += $result['delivered'];
+                $failedTotal += $result['recipients'] - $result['delivered'];
+
+                foreach ($result['errors'] as $error) {
+                    if (\count($deliveryErrors) >= MESSAGE_DELIVERY_ERRORS_LIMIT) {
+                        break;
+                    }
+
+                    $deliveryErrors[] = $error;
+                }
+            }
+        }
+
+        if (!$hasRecipients) {
+            $dbForProject->updateDocument('messages', $message->getId(), $message->setAttributes([
+                'status' => MessageStatus::FAILED,
+                'deliveryErrors' => ['No valid recipients found.']
+            ]));
+
+            Span::add('message.skipped', 'no_valid_recipients');
+            return;
+        }
+
+        if (empty($deliveryErrors) && $deliveredTotal === 0) {
+            $deliveryErrors[] = 'Unknown error';
+        }
+
+        $hasFailures = $failedTotal > 0 || \count($deliveryErrors) > 0;
+        $message->setAttribute('status', $hasFailures ? MessageStatus::FAILED : MessageStatus::SENT);
+        $message->setAttribute('deliveryErrors', $deliveryErrors);
+
+        Span::add('message.delivered_total', $deliveredTotal);
+        Span::add('message.errors_total', $failedTotal);
+
+        $message->removeAttribute('to');
+
+        foreach ($providers as $provider) {
+            $message->setAttribute('search', "{$message->getAttribute('search')} {$provider->getAttribute('name')} {$provider->getAttribute('provider')} {$provider->getAttribute('type')}");
+        }
+
+        Span::add('message.providers', \implode(',', \array_unique(\array_map(
+            fn (Document $provider) => $provider->getAttribute('provider'),
+            \array_values($providers)
+        ))));
+
+        $message->setAttribute('deliveredTotal', $deliveredTotal);
+        $message->setAttribute('deliveredAt', DateTime::now());
+
+        $dbForProject->updateDocument('messages', $message->getId(), new Document([
+            'deliveryErrors' => $message->getAttribute('deliveryErrors'),
+            'status' => $message->getAttribute('status'),
+            'search' => $message->getAttribute('search'),
+            'deliveredTotal' => $message->getAttribute('deliveredTotal'),
+            'deliveredAt' => $message->getAttribute('deliveredAt'),
+        ]));
+    }
+
+    /**
+     * Stream a message's recipients in bounded pages, grouped by provider and deduplicated by identifier within each page.
+     *
+     * Peak memory is O(MESSAGE_RECIPIENTS_PAGE_SIZE), never O(topic size): topics are walked through the
+     * subscribers collection with cursor pagination rather than reading the topic's `targets` attribute, which
+     * is capped at APP_LIMIT_SUBSCRIBERS_SUBQUERY and would silently drop the rest of the recipients.
+     * Decode filters run regardless of Query::select, so the topic lookup below skips that filter explicitly
+     * rather than relying on selecting only $sequence.
+     *
+     * @param array<string> $topicIds
+     * @param array<string> $userIds
+     * @param array<string> $targetIds
+     * @return \Generator<array{0: array<string, array<string, string>>, 1: bool}>
+     * @throws \Exception
+     */
+    private function streamRecipients(
+        Database $dbForProject,
+        array $topicIds,
+        array $userIds,
+        array $targetIds,
+        string $providerType,
+        Document $default
+    ): \Generator {
+        if (\count($topicIds) > 0) {
+            $topics = $dbForProject->skipFilters(
+                fn () => $dbForProject->find('topics', [
+                    Query::select(['$sequence']),
+                    Query::equal('$id', $topicIds),
+                    Query::limit(\count($topicIds)),
+                ]),
+                APP_TOPICS_SUBQUERIES
+            );
+
+            foreach ($topics as $topic) {
+                $cursor = null;
+
+                do {
+                    $queries = [
+                        Query::equal('topicInternalId', [$topic->getSequence()]),
+                        Query::equal('providerType', [$providerType]),
+                        Query::select(['$sequence', 'targetInternalId']),
+                        Query::orderAsc('$sequence'),
+                        Query::limit(MESSAGE_RECIPIENTS_PAGE_SIZE),
+                    ];
+
+                    if ($cursor !== null) {
+                        $queries[] = Query::cursorAfter($cursor);
+                    }
+
+                    $subscribers = $dbForProject->getAuthorization()->skip(
+                        fn () => $dbForProject->find('subscribers', $queries)
+                    );
+
+                    $count = \count($subscribers);
+
+                    if ($count === 0) {
+                        break;
+                    }
+
+                    $cursor = $subscribers[$count - 1];
+
+                    $targetInternalIds = \array_map(
+                        fn (Document $subscriber) => $subscriber->getAttribute('targetInternalId'),
+                        $subscribers
+                    );
+
+                    $targets = $dbForProject->skipValidation(
+                        fn () => $dbForProject->getAuthorization()->skip(
+                            fn () => $dbForProject->find('targets', [
+                                Query::equal('$sequence', $targetInternalIds),
+                                Query::select(['providerId', 'identifier', 'userId', 'expired']),
+                                Query::limit(\count($targetInternalIds)),
+                            ])
+                        )
+                    );
+
+                    // Topic campaign: deliver on the topic's own channel, not a per-user topic.
+                    yield [$this->groupTargetsByProvider($targets, $default), false];
+                } while ($count === MESSAGE_RECIPIENTS_PAGE_SIZE);
+            }
+        }
+
+        if (\count($userIds) > 0) {
+            // Only address users that actually exist, so a bogus id can't create a phantom users/
+            // topic or be counted as delivered.
+            $existingUserIds = \array_map(
+                fn (Document $user) => $user->getId(),
+                $dbForProject->getAuthorization()->skip(
+                    fn () => $dbForProject->find('users', [
+                        Query::equal('$id', \array_values(\array_unique($userIds))),
+                        Query::select(['$id']),
+                        Query::limit(\count($userIds)),
+                    ])
+                )
+            );
+
+            // Resolve each user's registered device targets first, so FCM/APNS (and any explicit
+            // Appwrite target) still receive — the reserved topic is additive, not a replacement.
+            $reachedViaTarget = [];
+            $cursor = null;
+
+            do {
+                $queries = [
+                    Query::equal('userId', $existingUserIds),
+                    Query::equal('providerType', [$providerType]),
+                    Query::select(['$sequence', 'providerId', 'identifier', 'userId', 'expired']),
+                    Query::orderAsc('$sequence'),
+                    Query::limit(MESSAGE_RECIPIENTS_PAGE_SIZE),
+                ];
+
+                if ($cursor !== null) {
+                    $queries[] = Query::cursorAfter($cursor);
+                }
+
+                $targets = $existingUserIds === [] ? [] : $dbForProject->find('targets', $queries);
+                $count = \count($targets);
+
+                if ($count === 0) {
+                    break;
+                }
+
+                $cursor = $targets[$count - 1];
+
+                foreach ($targets as $target) {
+                    // groupTargetsByProvider drops expired targets, so an expired-only user is not
+                    // actually reached and must still get the direct MQTT fallback below.
+                    if (!$target->getAttribute('expired')) {
+                        $reachedViaTarget[$target->getAttribute('userId')] = true;
+                    }
+                }
+
+                // User-addressed: deliver on the reserved per-user topic (Appwrite push).
+                yield [$this->groupTargetsByProvider($targets, $default), true];
+            } while ($count === MESSAGE_RECIPIENTS_PAGE_SIZE);
+
+            // Appwrite push needs no device target: reach existing users with no registered target on
+            // their reserved MQTT topic (users/<userId>), which they subscribe to with their session.
+            if ($default->getAttribute('provider') === 'appwrite') {
+                $targetless = \array_values(\array_filter(
+                    $existingUserIds,
+                    fn (string $userId) => !isset($reachedViaTarget[$userId]),
+                ));
+
+                foreach (\array_chunk($targetless, MESSAGE_RECIPIENTS_PAGE_SIZE) as $chunk) {
+                    $identifiers = [];
+                    foreach ($chunk as $userId) {
+                        $identifiers[$userId] = $userId;
+                    }
+
+                    yield [[$default->getId() => $identifiers], true];
+                }
+            }
+        }
+
+        if (\count($targetIds) > 0) {
+            $cursor = null;
+
+            do {
+                $queries = [
+                    Query::equal('$id', $targetIds),
+                    Query::equal('providerType', [$providerType]),
+                    Query::select(['$sequence', 'providerId', 'identifier', 'userId', 'expired']),
+                    Query::orderAsc('$sequence'),
+                    Query::limit(MESSAGE_RECIPIENTS_PAGE_SIZE),
+                ];
+
+                if ($cursor !== null) {
+                    $queries[] = Query::cursorAfter($cursor);
+                }
+
+                $targets = $dbForProject->find('targets', $queries);
+                $count = \count($targets);
+
+                if ($count === 0) {
+                    break;
+                }
+
+                $cursor = $targets[$count - 1];
+
+                // User- or target-addressed: deliver on the reserved per-user topic (Appwrite push).
+                yield [$this->groupTargetsByProvider($targets, $default), true];
+            } while ($count === MESSAGE_RECIPIENTS_PAGE_SIZE);
+        }
+    }
+
+    /**
+     * Group a page of target documents by provider id, deduplicating identifiers within the page and
+     * dropping targets already known to be unreachable. Each identifier maps to its target's user id,
+     * which the Appwrite push provider uses to deliver on the reserved per-user topic (see the send
+     * loop); other providers only read the keys.
+     *
+     * @param array<Document> $targets
+     * @return array<string, array<string, string>>
+     */
+    private function groupTargetsByProvider(array $targets, Document $default): array
+    {
+        /**
+         * @var array<string, array<string, string>> $identifiers
+         */
+        $identifiers = [];
+
+        foreach ($targets as $target) {
+            // sendBatch() flags a target when a provider reports its token as dead, but the row only goes
+            // away on the next maintenance sweep. Rows predating the attribute read null, so anything
+            // but a positive flag counts as reachable.
+            if ($target->getAttribute('expired')) {
+                continue;
+            }
+
+            $providerId = $target->getAttribute('providerId') ?: $default->getId();
+
+            if (!\array_key_exists($providerId, $identifiers)) {
+                $identifiers[$providerId] = [];
+            }
+
+            // identifier => userId: the key dedupes recipients; the value lets the Appwrite push
+            // provider collapse a user's targets to one users/<userId> topic.
+            $identifiers[$providerId][$target->getAttribute('identifier')] = $target->getAttribute('userId');
+        }
+
+        return $identifiers;
+    }
+
+    /**
+     * Resolve and cache a provider for the lifetime of a send job, falling back to the default provider.
+     *
+     * @param array<string, Document> $providers
+     */
+    private function resolveProvider(
+        Database $dbForProject,
+        string $providerId,
+        array &$providers,
+        Document $default
+    ): Document {
+        if (\array_key_exists($providerId, $providers)) {
+            return $providers[$providerId];
+        }
+
+        $provider = $dbForProject->getDocument('providers', $providerId);
+
+        if ($provider->isEmpty() || !$provider->getAttribute('enabled')) {
+            // Cache the fallback under this id too, so a topic full of targets pointing at the same
+            // disabled/missing provider does not re-query the providers collection once per page.
+            $providers[$providerId] = $default;
+
+            return $default;
+        }
+
+        $providers[$providerId] = $provider;
+
+        return $provider;
+    }
+
+    /**
+     * Send a single adapter-sized batch and report delivery counts plus a bounded error list.
+     *
+     * Wraps the provider call in a backoff/retry loop that reacts to provider rate limiting and transient
+     * failures (see {@see retrySend()}). Accounting stays exact: only still-failing recipients are ever
+     * retried, so `delivered` is summed across attempts without double-counting, and `recipients` always
+     * reports the original batch size so the caller's `failed = recipients - delivered` holds.
+     *
+     * @param array<string> $batch
+     * @param array<Attachment> $attachments
+     * @return array{delivered: int, recipients: int, errors: array<string>}
+     */
+    private function sendBatch(
+        array $batch,
+        Document $message,
+        Document $provider,
+        string $providerType,
+        EmailAdapter|SMSAdapter|PushAdapter $adapter,
+        Database $dbForProject,
+        Document $project,
+        UsagePublisher $publisherForUsage,
+        array $attachments
+    ): array {
+        $recipients = \count($batch);
+
+        [
+            'delivered' => $delivered,
+            'errors' => $errors,
+        ] = $this->retrySend($batch, $message, $provider, $providerType, $adapter, $dbForProject, $attachments);
+
+        $failed = $recipients - $delivered;
+
+        $usage = new UsageContext();
+        $usage
+            ->setResource(METRIC_MESSAGES_RESOURCE_TYPE)
+            ->setResourceId($message->getId())
+            ->setResourceInternalId((string) $message->getSequence())
+            ->addMetric(METRIC_MESSAGES, $recipients)
+            ->addMetric(METRIC_MESSAGES_SENT, $delivered)
+            ->addMetric(METRIC_MESSAGES_FAILED, $failed)
+            ->addMetric(str_replace('{type}', $provider->getAttribute('type'), METRIC_MESSAGES_TYPE), $recipients)
+            ->addMetric(str_replace('{type}', $provider->getAttribute('type'), METRIC_MESSAGES_TYPE_SENT), $delivered)
+            ->addMetric(str_replace('{type}', $provider->getAttribute('type'), METRIC_MESSAGES_TYPE_FAILED), $failed)
+            ->addMetric(str_replace(['{type}', '{provider}'], [$provider->getAttribute('type'), $provider->getAttribute('provider')], METRIC_MESSAGES_TYPE_PROVIDER), $recipients)
+            ->addMetric(str_replace(['{type}', '{provider}'], [$provider->getAttribute('type'), $provider->getAttribute('provider')], METRIC_MESSAGES_TYPE_PROVIDER_SENT), $delivered)
+            ->addMetric(str_replace(['{type}', '{provider}'], [$provider->getAttribute('type'), $provider->getAttribute('provider')], METRIC_MESSAGES_TYPE_PROVIDER_FAILED), $failed);
+
+        $publisherForUsage->enqueue(new Usage(
+            project: $project,
+            metrics: $usage->getMetrics(),
+        ));
+
+        return [
+            'delivered' => $delivered,
+            'recipients' => $recipients,
+            'errors' => $errors,
+        ];
+    }
+
+    /**
+     * Drive a batch through provider sends with exponential backoff, reacting to throttling and transient
+     * errors by retrying only the recipients that are still failing.
+     *
+     * Partitioning per attempt: the provider's per-recipient results are split into delivered (summed into
+     * the running total, never retried) and failures. A failure whose error matches {@see isRetryableError()}
+     * stays pending for the next attempt; any other failure becomes a terminal error immediately. When
+     * `send()` throws, the throw is retryable only if its message matches; otherwise every still-pending
+     * recipient is recorded as terminal. The next attempt rebuilds the provider message with only the pending
+     * recipients in `to`, so an already-delivered recipient is never re-sent. After {@see MESSAGE_SEND_MAX_RETRIES}
+     * attempts, any recipients still pending are flushed to terminal errors.
+     *
+     * Note: provider `Retry-After` hints are not honored — the agnostic adapter {@see \Utopia\Messaging\Response}
+     * exposes only generic per-recipient strings, never a structured retry delay, so we keep the library
+     * adapter-agnostic and rely on exponential backoff alone.
+     *
+     * @param array<string> $batch
+     * @param array<Attachment> $attachments
+     * @return array{delivered: int, errors: array<string>}
+     */
+    private function retrySend(
+        array $batch,
+        Document $message,
+        Document $provider,
+        string $providerType,
+        EmailAdapter|SMSAdapter|PushAdapter $adapter,
+        Database $dbForProject,
+        array $attachments
+    ): array {
+        $delivered = 0;
+        $errors = [];
+
+        // Recipients still awaiting a successful (or terminal) outcome; shrinks to only the failing ones each attempt.
+        $pending = $batch;
+
+        for ($attempt = 1; $attempt <= MESSAGE_SEND_MAX_RETRIES; $attempt++) {
+            $hasRetriesLeft = $attempt < MESSAGE_SEND_MAX_RETRIES;
+
+            $retry = [];
+
+            // Rebuild the provider message scoped to only the still-pending recipients so a partially-delivered
+            // batch never re-sends to recipients that already succeeded on an earlier attempt. A recipient no
+            // provider can deliver to is recorded as terminal and dropped, so it never costs the rest their send.
+            $data = null;
+            while ($pending !== []) {
+                try {
+                    $data = $this->buildMessage($pending, $message, $provider, $providerType, $dbForProject, $attachments);
+                    break;
+                } catch (InvalidArgumentException $e) {
+                    $recipient = $e->getValue();
+
+                    if ($recipient === null || !\in_array($recipient, $pending, true)) {
+                        $this->recordError($errors, 'Failed sending to targets with error: ' . $e->getMessage());
+                        $pending = [];
+                        break;
+                    }
+
+                    $this->recordError($errors, "Failed sending to target {$recipient} with error: {$e->getMessage()}");
+                    $pending = \array_values(\array_diff($pending, [$recipient]));
+                }
+            }
+
+            if ($data === null) {
+                break;
+            }
+
+            // The try/catch wraps ONLY the provider send. A whole-batch throw is retryable when transient,
+            // otherwise it records one representative terminal error. The previous behaviour of resetting
+            // $delivered to 0 on a throw is gone — the retry refactor sums delivered across attempts, and the
+            // expired-device-token cleanup below is isolated in its own try so a DB hiccup there can never be
+            // misattributed as a send failure.
+            try {
+                $response = $adapter->send($data);
+            } catch (\Throwable $e) {
+                if ($hasRetriesLeft && !$e instanceof InvalidArgumentException && $this->isRetryableError($e->getMessage())) {
+                    $retry = $pending;
+                } else {
+                    $this->recordError($errors, 'Failed sending to targets with error: ' . $e->getMessage());
+                }
+
+                $response = null;
+            }
+
+            if ($response !== null) {
+                $delivered += (int) $response['deliveredTo'];
+
+                foreach ($response['results'] as $result) {
+                    if ($result['status'] !== 'failure') {
+                        continue;
+                    }
+
+                    $error = $result['error'] ?? null;
+                    $recipient = $result['recipient'];
+
+                    // Best-effort: deleting push targets when the token has expired. Isolated so a transient DB
+                    // error here never affects delivery accounting or the retry decision below.
+                    if ($error === 'Expired device token') {
+                        try {
+                            $target = $dbForProject->findOne('targets', [
+                                Query::equal('identifier', [$recipient])
+                            ]);
+
+                            if (!$target->isEmpty()) {
+                                $dbForProject->updateDocument(
+                                    'targets',
+                                    $target->getId(),
+                                    $target->setAttribute('expired', true)
+                                );
+                            }
+                        } catch (\Throwable) {
+                            // Best-effort; must not affect accounting or retries.
+                        }
+                    }
+
+                    if ($hasRetriesLeft && $this->isRetryableError($error)) {
+                        $retry[] = $recipient;
+                        continue;
+                    }
+
+                    $this->recordError($errors, "Failed sending to target {$recipient} with error: {$error}");
+                }
+            }
+
+            $pending = $retry;
+
+            if (empty($pending)) {
+                break;
+            }
+
+            // Exponential backoff with jitter; non-blocking under Swoole so sibling sends keep progressing.
+            // Skip a non-positive delay: Swoole\Coroutine::sleep() rejects 0/negative values (which tests
+            // produce by overriding the base delay to 0 for speed), and it would otherwise emit a warning.
+            $delay = $this->retryDelay() * (2 ** ($attempt - 1));
+            $delay += $delay * (\random_int(0, 100) / 1000);
+            if ($delay > 0) {
+                \Swoole\Coroutine::sleep($delay);
+            }
+        }
+
+        return [
+            'delivered' => $delivered,
+            'errors' => $errors,
+        ];
+    }
+
+    /**
+     * Append a delivery error while keeping the retained list bounded by {@see MESSAGE_DELIVERY_ERRORS_LIMIT}.
+     *
+     * @param array<string> $errors
+     */
+    private function recordError(array &$errors, string $error): void
+    {
+        if (\count($errors) >= MESSAGE_DELIVERY_ERRORS_LIMIT) {
+            return;
+        }
+
+        $errors[] = $error;
+    }
+
+    /**
+     * Conservatively classify a provider error string as retryable. The agnostic adapter
+     * {@see \Utopia\Messaging\Response} returns only free-form error strings, so string matching is the only
+     * provider-agnostic signal available. The pattern list is intentionally narrow — throttling, rate limits,
+     * quota, service-unavailable and timeout phrasing — so permanent failures (e.g. invalid recipients) are
+     * never retried.
+     */
+    private function isRetryableError(?string $error): bool
+    {
+        if ($error === null || $error === '') {
+            return false;
+        }
+
+        $patterns = [
+            'throttl',
+            'rate exceeded',
+            'rate limit',
+            'too many requests',
+            '429',
+            'quota',
+            'service unavailable',
+            '503',
+            'timed out',
+            'timeout',
+            'temporarily',
+        ];
+
+        $needle = \strtolower($error);
+
+        foreach ($patterns as $pattern) {
+            if (\str_contains($needle, $pattern)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Base seconds for exponential backoff between send retries. Isolated so tests can override it to keep the
+     * suite instant without touching the production constant.
+     */
+    protected function retryDelay(): float
+    {
+        return MESSAGE_SEND_RETRY_DELAY;
+    }
+
+    /**
+     * Build the provider-specific message for a set of recipients.
+     *
+     * @param array<string> $to
+     * @param array<Attachment> $attachments
+     */
+    private function buildMessage(
+        array $to,
+        Document $message,
+        Document $provider,
+        string $providerType,
+        Database $dbForProject,
+        array $attachments
+    ): Email|SMS|Push {
+        $messageData = clone $message;
+        $messageData->setAttribute('to', $to);
+
+        $data = match ($providerType) {
+            MESSAGE_TYPE_SMS => $this->buildSmsMessage($messageData, $provider),
+            MESSAGE_TYPE_PUSH => $this->buildPushMessage($messageData),
+            MESSAGE_TYPE_EMAIL => $this->buildEmailMessage($dbForProject, $messageData, $provider, $attachments),
+            default => throw new \Exception('Provider with the requested ID is of the incorrect type')
+        };
+
+        $data->setOrigin(MESSAGE_SEND_TYPE_EXTERNAL);
+
+        return $data;
+    }
+
+    private function sendInternalSMSMessage(Document $message, Document $project, array $recipients, ?SMSAdapter $adapterForSMS): void
+    {
+        if ($adapterForSMS === null) {
+            throw new \Exception('SMS adapter is not set.');
+        }
+
+        if ($project->isEmpty()) {
+            throw new \Exception('Project not set in payload');
+        }
+
+        $denyList = System::getEnv('_APP_SMS_PROJECTS_DENY_LIST', '');
+        $denyList = explode(',', $denyList);
+        if (\in_array($project->getId(), $denyList)) {
+            Span::add('message.skipped', 'project_denied');
+            return;
+        }
+
+        $from = System::getEnv('_APP_SMS_FROM', '');
+        Span::add('message.from', $from);
+
+        Span::add('message.country_code', CallingCode::fromPhoneNumber($recipients[0] ?? '') ?? 'unknown');
+
+        $sms = new SMS(
+            $recipients,
+            $message->getAttribute('data')['content'],
+            $from
+        );
+        $sms->setOrigin(MESSAGE_SEND_TYPE_INTERNAL);
+
+        // Attach the project ID so the SMS provider's delivery logs and
+        // webhooks can be attributed back to the originating project.
+        $sms->setMetadata([MetadataParameter::UUID->value => $project->getId()]);
+
+        $adapterForSMS->send($sms);
+    }
+
+
+    protected function getPushAdapter(Document $provider, Database $dbForProject, Document $project, Document $message): ?PushAdapter
+    {
+        $credentials = $provider->getAttribute('credentials');
+        $options = $provider->getAttribute('options');
+
+        $adapter = match ($provider->getAttribute('provider')) {
+            'mock' => new Mock('username', 'password'),
+            'apns' => new APNS(
+                $credentials['authKey'] ?? '',
+                $credentials['authKeyId'] ?? '',
+                $credentials['teamId'] ?? '',
+                $credentials['bundleId'] ?? '',
+                $options['sandbox'] ?? false
+            ),
+            'fcm' => new FCM(\json_encode($credentials['serviceAccountJSON'])),
+            'appwrite' => new AppwritePush(
+                new Mqtt($this->telemetry, new PubSubPool($this->pools->get('pubsub'))),
+                $dbForProject,
+                $project->getId(),
+                $message->getId(),
+                $message->getSequence(),
+                $options['qos'] ?? Packet::QOS_1,
+            ),
+            default => null
+        };
+
+        if ($adapter !== null) {
+            $adapter->setTelemetry($this->telemetry);
+        }
+
+        return $adapter;
+    }
+
+    /**
+     * Materialise a message's attachments as files the adapters can read.
+     *
+     * Uploads are compressed and then encrypted, so a stored file is not what the recipient should get; both
+     * are undone here in reverse, as the storage read endpoints do. The plaintext is written under
+     * $directory and never back to the file's own path, which on a local install is the stored original.
+     *
+     * Bytes travel as a path rather than as Attachment content because Sendgrid and Mailgun read only
+     * getPath(), and content would otherwise stay resident for the whole fan-out.
+     *
+     * @return array<Attachment>
+     */
+    private function prepareAttachments(
+        Database $dbForProject,
+        Document $message,
+        Device $deviceForFiles,
+        Document $project,
+        string $directory
+    ): array {
+        $prepared = [];
+        $mimes = Config::getParam('storage-mimes');
+
+        foreach ($message->getAttribute('data', [])['attachments'] ?? [] as $attachment) {
+            $bucket = $dbForProject->getDocument('buckets', $attachment['bucketId']);
+            if ($bucket->isEmpty()) {
+                throw new \Exception('Storage bucket with the requested ID could not be found');
+            }
+
+            $file = $dbForProject->getDocument('bucket_' . $bucket->getSequence(), $attachment['fileId']);
+            if ($file->isEmpty()) {
+                throw new \Exception('Storage file with the requested ID could not be found');
+            }
+
+            $path = $file->getAttribute('path', '');
+            if (!$deviceForFiles->exists($path)) {
+                throw new \Exception('File not found in ' . $path);
+            }
+
+            $contentType = \in_array($file->getAttribute('mimeType'), $mimes)
+                ? $file->getAttribute('mimeType')
+                : 'text/plain';
+
+            $cipher = $file->getAttribute('openSSLCipher', '');
+            $algorithm = $file->getAttribute('algorithm', Compression::NONE);
+            $target = $directory . '/' . $bucket->getId() . '/' . $file->getId();
+
+            if (empty($cipher) && !\in_array($algorithm, [Compression::GZIP, Compression::ZSTD], true)) {
+                if ($deviceForFiles->getType() !== DeviceType::Local) {
+                    $deviceForFiles->copy($path, $target, $this->getLocalDevice($project));
+                    $path = $target;
+                }
+
+                $prepared[] = new Attachment($file->getAttribute('name'), $path, $contentType);
+                continue;
+            }
+
+            $source = (string) $deviceForFiles->read($path);
+
+            if (!empty($cipher)) {
+                $source = OpenSSL::decrypt(
+                    $source,
+                    $cipher,
+                    System::getEnv('_APP_OPENSSL_KEY_V' . $file->getAttribute('openSSLVersion')),
+                    0,
+                    \hex2bin($file->getAttribute('openSSLIV')),
+                    \hex2bin($file->getAttribute('openSSLTag'))
+                );
+
+                // A rotated or missing key leaves ciphertext no one can read, which must fail the send rather
+                // than reach a recipient.
+                if ($source === false) {
+                    throw new \Exception('Failed to decrypt attachment ' . $file->getId());
+                }
+            }
+
+            $decompressed = match ($algorithm) {
+                Compression::ZSTD => (new Zstd())->decompress($source),
+                Compression::GZIP => (new GZIP())->decompress($source),
+                default => $source,
+            };
+
+            // A decompressor reports failure as an empty string. Files stored above the read buffer before 1.5.0
+            // recorded an algorithm they were never compressed with, so their bytes are already what the
+            // recipient wants; the storage read endpoints fall back to them rather than failing the read.
+            $source = $decompressed === '' && (int) $file->getAttribute('sizeOriginal') > 0
+                ? $source
+                : $decompressed;
+
+            if (!$this->getLocalDevice($project)->write($target, new Stream($source), $contentType)) {
+                throw new \Exception('Failed to prepare attachment ' . $file->getId());
+            }
+
+            $prepared[] = new Attachment($file->getAttribute('name'), $target, $contentType);
+        }
+
+        return $prepared;
+    }
+
+    /**
+     * @param array<Attachment> $attachments
+     */
+    private function buildEmailMessage(
+        Database $dbForProject,
+        Document $message,
+        Document $provider,
+        array $attachments,
+    ): Email {
+        $fromName = $provider['options']['fromName'] ?? null;
+        $fromEmail = $provider['options']['fromEmail'] ?? null;
+        $data = $message['data'] ?? [];
+        $replyToEmail = !empty($data['replyToEmail']) ? $data['replyToEmail'] : ($provider['options']['replyToEmail'] ?? null);
+        $replyToName = !empty($data['replyToName']) ? $data['replyToName'] : ($provider['options']['replyToName'] ?? null);
+        $ccTargets = $data['cc'] ?? [];
+        $bccTargets = $data['bcc'] ?? [];
+        $cc = [];
+        $bcc = [];
+
+        if (!empty($ccTargets)) {
+            $ccTargets = $dbForProject->find('targets', [
+                Query::equal('$id', $ccTargets),
+                Query::limit(\count($ccTargets)),
+            ]);
+            foreach ($ccTargets as $ccTarget) {
+                $cc[] = ['email' => $ccTarget['identifier']];
+            }
+        }
+
+        if (!empty($bccTargets)) {
+            $bccTargets = $dbForProject->find('targets', [
+                Query::equal('$id', $bccTargets),
+                Query::limit(\count($bccTargets)),
+            ]);
+            foreach ($bccTargets as $bccTarget) {
+                $bcc[] = ['email' => $bccTarget['identifier']];
+            }
+        }
+
+        $to = $message['to'];
+        $subject = $data['subject'];
+        $content = $data['content'];
+        $html = $data['html'] ?? false;
+
+        // An SMTP batch is one message, so a visible To header is readable by every other address on
+        // it. Only a lone recipient with nobody else on the envelope keeps theirs; the rest move to
+        // BCC, which leaves the message with no To header at all.
+        if ($provider->getAttribute('provider') === 'smtp' && (\count($to) > 1 || !empty($cc) || !empty($bcc))) {
+            foreach ($to as $recipient) {
+                $bcc[] = ['email' => $recipient];
+            }
+
+            $to = [];
+        }
+
+        return new Email(
+            $to,
+            $subject,
+            $content,
+            $fromName,
+            $fromEmail,
+            $replyToName,
+            $replyToEmail,
+            $cc,
+            $bcc,
+            $attachments,
+            $html
+        );
+    }
+
+    private function buildSmsMessage(Document $message, Document $provider): SMS
+    {
+        $to = $message['to'];
+        $content = $message['data']['content'];
+        $from = $provider['options']['from'];
+
+        return new SMS(
+            $to,
+            $content,
+            $from
+        );
+    }
+
+    private function buildPushMessage(Document $message): Push
+    {
+        $to = $message['to'];
+        $title = $message['data']['title'] ?? null;
+        $body = $message['data']['body'] ?? null;
+        $data = $message['data']['data'] ?? null;
+        $action = $message['data']['action'] ?? null;
+        $image = $message['data']['image']['url'] ?? null;
+        $sound = $message['data']['sound'] ?? null;
+        $icon = $message['data']['icon'] ?? null;
+        $color = $message['data']['color'] ?? null;
+        $tag = $message['data']['tag'] ?? null;
+        $badge = $message['data']['badge'] ?? null;
+        $contentAvailable = $message['data']['contentAvailable'] ?? null;
+        $critical = $message['data']['critical'] ?? null;
+        $priority = $message['data']['priority'] ?? null;
+        $channelId = $message['data']['channelId'] ?? null;
+
+        if ($title === '') {
+            $title = null;
+        }
+        if ($body === '') {
+            $body = null;
+        }
+        if ($priority !== null) {
+            $priority = $priority === 'high'
+                ? Priority::HIGH
+                : Priority::NORMAL;
+        }
+
+        return new Push(
+            $to,
+            $title,
+            $body,
+            $data,
+            $action,
+            $sound,
+            $image,
+            $icon,
+            $color,
+            $tag,
+            $badge,
+            $contentAvailable,
+            $critical,
+            $priority,
+            $channelId
+        );
+    }
+
+    private function getLocalDevice($project): Local
+    {
+        // Not cached: the path is project-scoped and the worker handles
+        // messages from many projects (and coroutines run them concurrently).
+        return new Local(APP_STORAGE_UPLOADS . '/app-' . $project->getId());
+    }
+
+}
